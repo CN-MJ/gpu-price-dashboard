@@ -4,6 +4,8 @@
 
 ## 本地运行
 
+Windows（cmd / PowerShell）与 macOS / Linux 相同：
+
 ```bash
 npm install
 npm run dev
@@ -11,7 +13,7 @@ npm run dev
 
 打开 [http://127.0.0.1:3000](http://127.0.0.1:3000)。
 
-本地未设置 `DATABASE_URL` 时使用内存 PGlite；发布后若声明了 Postgres，则自动切到平台库。
+`dev` / `collect` 通过 Node 辅助脚本在本地强制去掉 `DATABASE_URL`（跨平台，不依赖 Unix `env -u`），从而使用内存 PGlite；发布后若平台注入了 Postgres，则自动切到平台库。
 
 ## 数据说明
 

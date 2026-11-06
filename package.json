@@ -7,7 +7,7 @@
     "build": "next build && node scripts/migrate.mjs",
     "start": "next start --hostname 127.0.0.1 --port 3000",
     "lint": "eslint",
-    "collect": "node scripts/run-without-database-url.mjs npx --yes tsx scripts/collect-once.ts"
+    "collect": "node scripts/run-without-database-url.mjs node --import tsx scripts/collect-once.ts"
   },
   "dependencies": {
     "@electric-sql/pglite": "^0.5.15",

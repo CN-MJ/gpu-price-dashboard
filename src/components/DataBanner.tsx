@@ -3,12 +3,15 @@ import type { CollectResult } from "@/lib/collect";
 export function DataBanner({ status }: { status: CollectResult }) {
   const newsLabel =
     status.newsSource === "rss" ? "公开 RSS（真实）" : "样例摘要（回退）";
+  const rawSource = String(status.priceSource ?? "");
   const priceLabel =
-    status.priceSource === "live"
+    rawSource === "live"
       ? "实采"
-      : status.priceSource === "mixed"
-        ? "实采 + 演示回退"
-        : "演示/回退数据";
+      : rawSource === "empty"
+        ? "尚无报价（请 npm run collect）"
+        : rawSource === "mixed" || rawSource === "demo"
+          ? "请重新 collect（已取消演示回填）"
+          : "尚无报价";
   const platformBits = status.platformStatus
     ? Object.entries(status.platformStatus)
         .map(([id, s]) => `${id}:${s.status}`)
@@ -27,8 +30,8 @@ export function DataBanner({ status }: { status: CollectResult }) {
             {priceLabel}
           </strong>
           （京东 / 天猫 / 拼多多 / 淘宝
-          {status.liveOffers != null
-            ? ` · 实采 ${status.liveOffers} / 演示 ${status.demoOffers ?? 0}`
+          {typeof status.liveOffers === "number"
+            ? ` · 实采 ${status.liveOffers} 条`
             : ""}
           ）
         </span>

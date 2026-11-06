@@ -33,6 +33,20 @@ export type SnapshotRow = {
   shop_name: string;
 };
 
+export type PlatformSnapshotRow = {
+  snapshot_date: string;
+  platform: string;
+  min_price_cents: number;
+  shop_name: string;
+};
+
+export type PlatformCompareRow = {
+  platform: string;
+  min_price_cents: number;
+  shop_name: string;
+  offer_count: number;
+};
+
 export type NewsRow = {
   id: string;
   title: string;
@@ -117,6 +131,49 @@ export async function listSnapshots(
      where product_id = $1
      order by snapshot_date asc`,
     [productId],
+  );
+}
+
+/** Daily per-platform lows for multi-line price curves. */
+export async function listPlatformSnapshots(
+  productId: string,
+): Promise<PlatformSnapshotRow[]> {
+  await ensureData();
+  return sql<PlatformSnapshotRow>(
+    `select snapshot_date::text, platform, min_price_cents, shop_name
+     from platform_snapshots
+     where product_id = $1
+     order by snapshot_date asc, platform asc`,
+    [productId],
+  );
+}
+
+/** Today's best price per platform (from current offers). */
+export async function listPlatformCompare(
+  productId: string,
+): Promise<PlatformCompareRow[]> {
+  await ensureData();
+  const offers = await listOffers(productId);
+  const map = new Map<string, PlatformCompareRow>();
+  for (const o of offers.filter((x) => x.in_stock)) {
+    const cur = map.get(o.platform);
+    if (!cur) {
+      map.set(o.platform, {
+        platform: o.platform,
+        min_price_cents: o.price_cents,
+        shop_name: o.shop_name,
+        offer_count: 1,
+      });
+      continue;
+    }
+    cur.offer_count += 1;
+    if (o.price_cents < cur.min_price_cents) {
+      cur.min_price_cents = o.price_cents;
+      cur.shop_name = o.shop_name;
+    }
+  }
+  return [...map.values()].sort(
+    (a, b) => a.min_price_cents - b.min_price_cents,
   );
 }
 

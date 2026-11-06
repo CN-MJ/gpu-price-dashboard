@@ -253,6 +253,12 @@ async function writeOffers(offers: StoredOffer[]): Promise<void> {
   }
 }
 
+/**
+ * Write/overwrite *today only*:
+ * - overall daily min → price_snapshots (UPSERT)
+ * - per-platform daily min → platform_snapshots (UPSERT)
+ * Historical days are preserved for price curves.
+ */
 async function writeTodaySnapshots(
   today: Date,
   todaysOffers: StoredOffer[],
@@ -265,9 +271,22 @@ async function writeTodaySnapshots(
     list.push(o);
     byProduct.set(o.productId, list);
   }
+
   for (const product of CATALOG) {
     const list = byProduct.get(product.id) ?? [];
-    if (list.length === 0) continue;
+    if (list.length === 0) {
+      // Same-day recollect found nothing for this SKU: clear today's rows only.
+      await sql(
+        `delete from price_snapshots where product_id = $1 and snapshot_date = $2::date`,
+        [product.id, dateStr],
+      );
+      await sql(
+        `delete from platform_snapshots where product_id = $1 and snapshot_date = $2::date`,
+        [product.id, dateStr],
+      );
+      continue;
+    }
+
     const best = list.reduce((a, b) =>
       a.priceCents <= b.priceCents ? a : b,
     );
@@ -288,6 +307,38 @@ async function writeTodaySnapshots(
       ],
     );
     snapCount += 1;
+
+    const byPlatform = new Map<string, StoredOffer[]>();
+    for (const o of list) {
+      const bucket = byPlatform.get(o.platform) ?? [];
+      bucket.push(o);
+      byPlatform.set(o.platform, bucket);
+    }
+    // Replace today's platform rows for this product, then insert fresh mins.
+    await sql(
+      `delete from platform_snapshots where product_id = $1 and snapshot_date = $2::date`,
+      [product.id, dateStr],
+    );
+    for (const [platform, offers] of byPlatform) {
+      const pBest = offers.reduce((a, b) =>
+        a.priceCents <= b.priceCents ? a : b,
+      );
+      await sql(
+        `insert into platform_snapshots(id, product_id, snapshot_date, platform, min_price_cents, shop_name)
+         values ($1,$2,$3::date,$4,$5,$6)
+         on conflict (product_id, snapshot_date, platform) do update set
+           min_price_cents = excluded.min_price_cents,
+           shop_name = excluded.shop_name`,
+        [
+          `${product.id}:${dateStr}:${platform}`,
+          product.id,
+          dateStr,
+          platform,
+          pBest.priceCents,
+          pBest.shopName,
+        ],
+      );
+    }
   }
   return snapCount;
 }
@@ -386,11 +437,9 @@ async function runCollect(opts: { live: boolean }): Promise<CollectResult> {
   }
 
   // Live collect: only real offers. No demo fill-ins.
+  // Offers table is always full-replace (current listing).
+  // Snapshots: only today's rows are overwritten; history kept for curves.
   await writeOffers(stored);
-  // Drop any prior demo/history placeholders so charts only show real days.
-  if (opts.live) {
-    await sql("delete from price_snapshots");
-  }
   const todaySnaps = await writeTodaySnapshots(today, stored);
   const news = await writeNews();
 
@@ -398,10 +447,13 @@ async function runCollect(opts: { live: boolean }): Promise<CollectResult> {
   const priceSource: CollectResult["priceSource"] =
     liveOffers > 0 ? "live" : "empty";
 
+  const histCount = await sql<{ n: string }>(
+    "select count(*)::text as n from price_snapshots",
+  );
   const result: CollectResult = {
     products: CATALOG.length,
     offers: stored.length,
-    snapshots: todaySnaps,
+    snapshots: Number(histCount[0]?.n ?? todaySnaps),
     news: news.count,
     newsSource: news.newsSource,
     priceSource,
@@ -410,7 +462,7 @@ async function runCollect(opts: { live: boolean }): Promise<CollectResult> {
     platformStatus: crawl.platforms,
     aggregatorStatus: crawl.aggregator,
     note: opts.live
-      ? buildNote(crawl, priceSource)
+      ? `${buildNote(crawl, priceSource)} 当日快照已覆盖写入（历史日期保留）。`
       : "尚未实采。请运行 npm run collect，或在已启动的站点请求 /api/refresh。本地数据保存在 .data/pglite，与网页共用。",
   };
   await metaSet("last_collect", JSON.stringify(result));

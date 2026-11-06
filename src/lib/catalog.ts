@@ -24,6 +24,38 @@ export const CATEGORY_LABELS: Record<Category, string> = {
   cpu: "处理器 CPU",
 };
 
+/** GPU 筛选：50 系 / 40 系 / AMD */
+export type GpuSeries = "rtx50" | "rtx40" | "amd";
+
+export const GPU_SERIES_LABELS: Record<GpuSeries, string> = {
+  rtx50: "NVIDIA 50 系",
+  rtx40: "NVIDIA 40 系",
+  amd: "AMD 显卡",
+};
+
+export function gpuSeriesOf(product: {
+  category: Category;
+  brand: string;
+  model: string;
+}): GpuSeries | null {
+  if (product.category !== "gpu") return null;
+  const model = product.model.toLowerCase();
+  if (/rtx\s*50\d{2}/i.test(model)) return "rtx50";
+  if (/rtx\s*40\d{2}/i.test(model)) return "rtx40";
+  if (
+    product.brand.toLowerCase() === "amd" ||
+    /radeon|\brx\s*\d{3,4}/i.test(model)
+  ) {
+    return "amd";
+  }
+  return null;
+}
+
+export function parseGpuSeries(raw: string | undefined | null): GpuSeries | "all" {
+  if (raw === "rtx50" || raw === "rtx40" || raw === "amd") return raw;
+  return "all";
+}
+
 /** 关注型号清单：NVIDIA 40/50 系桌面、AMD 新桌面卡、主流内存/SSD/CPU */
 export const CATALOG: CatalogProduct[] = [
   // NVIDIA 50 系

@@ -24,6 +24,9 @@
 .DS_Store
 *.pem
 
+# local PGlite data (shared by npm run collect / npm run dev)
+.data/
+
 # debug
 npm-debug.log*
 yarn-debug.log*

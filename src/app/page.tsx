@@ -30,8 +30,8 @@ export default async function HomePage() {
           硬价台
         </h1>
         <p className="max-w-2xl text-base leading-relaxed text-[var(--muted)]">
-          按品类扫一眼今日全平台最低价与店铺来源，入库后可看近 30
-          日走势；旁路追踪国内外 PC 硬件新闻。
+          按品类扫一眼今日全平台最低价与店铺来源；每个型号都有价格曲线与平台对比。
+          显卡可按 50 系 / 40 系 / AMD 筛选。同日重复采集会覆盖当天快照。
         </p>
       </section>
 

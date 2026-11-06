@@ -1,9 +1,5 @@
-import {
-  CATALOG,
-  DEMO_SHOPS,
-  PLATFORMS,
-  type CatalogProduct,
-} from "./catalog";
+import { CATALOG } from "./catalog";
+import { crawlLiveOffers, type CrawlReport } from "./crawl";
 import { sql } from "./db";
 
 type NewsCandidate = {
@@ -16,6 +12,17 @@ type NewsCandidate = {
   summary: string;
 };
 
+type StoredOffer = {
+  id: string;
+  productId: string;
+  platform: string;
+  shopName: string;
+  priceCents: number;
+  url: string;
+  inStock: boolean;
+  isDemo: boolean;
+};
+
 function hashSeed(input: string): number {
   let h = 2166136261;
   for (let i = 0; i < input.length; i++) {
@@ -23,11 +30,6 @@ function hashSeed(input: string): number {
     h = Math.imul(h, 16777619);
   }
   return h >>> 0;
-}
-
-function seededUnit(seed: number, salt: number): number {
-  const x = Math.sin(seed * 0.0001 + salt * 12.9898) * 43758.5453;
-  return x - Math.floor(x);
 }
 
 function dayKey(date: Date): string {
@@ -38,39 +40,6 @@ function addDays(base: Date, delta: number): Date {
   const d = new Date(base);
   d.setUTCDate(d.getUTCDate() + delta);
   return d;
-}
-
-/** 生成某日某型号的演示报价（四平台多店） */
-function demoOffersForDay(product: CatalogProduct, date: Date) {
-  const seed = hashSeed(`${product.id}:${dayKey(date)}`);
-  const dayJitter = (seededUnit(seed, 1) - 0.5) * 0.06;
-  const offers = [];
-  let i = 0;
-  for (const platform of PLATFORMS) {
-    const shops = DEMO_SHOPS[platform.id];
-    const shopCount = 2 + Math.floor(seededUnit(seed, 10 + i) * 2);
-    for (let s = 0; s < shopCount; s++) {
-      const shop = shops[s % shops.length];
-      const shopJitter =
-        (seededUnit(seed, 100 + i * 10 + s) - 0.45) * 0.08;
-      const priceCents = Math.max(
-        100,
-        Math.round(product.refPriceCents * (1 + dayJitter + shopJitter)),
-      );
-      offers.push({
-        id: `${product.id}:${platform.id}:${s}:${dayKey(date)}`,
-        productId: product.id,
-        platform: platform.id,
-        shopName: shop,
-        priceCents,
-        url: `https://search.${platform.id === "jd" ? "jd.com" : platform.id === "tmall" || platform.id === "taobao" ? "taobao.com" : "pinduoduo.com"}/?q=${encodeURIComponent(product.model)}`,
-        inStock: seededUnit(seed, 200 + i + s) > 0.08,
-        isDemo: true,
-      });
-    }
-    i += 1;
-  }
-  return offers;
 }
 
 const FALLBACK_NEWS: NewsCandidate[] = [
@@ -168,7 +137,7 @@ async function fetchRssNews(): Promise<NewsCandidate[]> {
       const timer = setTimeout(() => controller.abort(), 6000);
       const res = await fetch(feed.url, {
         signal: controller.signal,
-        headers: { "User-Agent": "crawlingGPUprice-mvp/0.1 (news-rss)" },
+        headers: { "User-Agent": "YingJiaTaiPriceBot/0.2 (news-rss)" },
         next: { revalidate: 0 },
       }).finally(() => clearTimeout(timer));
       if (!res.ok) continue;
@@ -222,7 +191,12 @@ export type CollectResult = {
   snapshots: number;
   news: number;
   newsSource: "rss" | "fallback";
-  priceSource: "demo";
+  /** live = 有实采；empty = 尚无报价（不再写入演示） */
+  priceSource: "live" | "empty";
+  liveOffers: number;
+  demoOffers: number;
+  platformStatus: CrawlReport["platforms"];
+  aggregatorStatus: CrawlReport["aggregator"];
   note: string;
 };
 
@@ -244,8 +218,7 @@ async function metaSet(key: string, value: string): Promise<void> {
   );
 }
 
-async function runCollect(): Promise<CollectResult> {
-  // 产品目录
+async function upsertProducts(): Promise<void> {
   for (const p of CATALOG) {
     await sql(
       `insert into products(id, category, brand, model, specs)
@@ -258,65 +231,122 @@ async function runCollect(): Promise<CollectResult> {
       [p.id, p.category, p.brand, p.model, p.specs],
     );
   }
+}
 
-  const today = new Date();
-  today.setUTCHours(12, 0, 0, 0);
-
-  // 刷新当日报价（演示数据：电商平台反爬严格，MVP 用可复现演示报价）
+async function writeOffers(offers: StoredOffer[]): Promise<void> {
   await sql("delete from offers");
-  let offerCount = 0;
-  for (const product of CATALOG) {
-    const offers = demoOffersForDay(product, today).filter((o) => o.inStock);
-    for (const o of offers) {
-      await sql(
-        `insert into offers(id, product_id, platform, shop_name, price_cents, url, in_stock, scraped_at, is_demo)
-         values ($1,$2,$3,$4,$5,$6,$7,now(),$8)`,
-        [
-          o.id,
-          o.productId,
-          o.platform,
-          o.shopName,
-          o.priceCents,
-          o.url,
-          o.inStock,
-          o.isDemo,
-        ],
-      );
-      offerCount += 1;
-    }
+  for (const o of offers) {
+    await sql(
+      `insert into offers(id, product_id, platform, shop_name, price_cents, url, in_stock, scraped_at, is_demo)
+       values ($1,$2,$3,$4,$5,$6,$7,now(),$8)`,
+      [
+        o.id,
+        o.productId,
+        o.platform,
+        o.shopName,
+        o.priceCents,
+        o.url,
+        o.inStock,
+        o.isDemo,
+      ],
+    );
+  }
+}
+
+/**
+ * Write/overwrite *today only*:
+ * - overall daily min → price_snapshots (UPSERT)
+ * - per-platform daily min → platform_snapshots (UPSERT)
+ * Historical days are preserved for price curves.
+ */
+async function writeTodaySnapshots(
+  today: Date,
+  todaysOffers: StoredOffer[],
+): Promise<number> {
+  const dateStr = dayKey(today);
+  let snapCount = 0;
+  const byProduct = new Map<string, StoredOffer[]>();
+  for (const o of todaysOffers.filter((x) => x.inStock)) {
+    const list = byProduct.get(o.productId) ?? [];
+    list.push(o);
+    byProduct.set(o.productId, list);
   }
 
-  // 写入近 30 日最低价快照（含今日）
-  let snapCount = 0;
-  for (let d = 29; d >= 0; d--) {
-    const date = addDays(today, -d);
-    const dateStr = dayKey(date);
-    for (const product of CATALOG) {
-      const offers = demoOffersForDay(product, date).filter((o) => o.inStock);
-      const best = offers.reduce((a, b) =>
+  for (const product of CATALOG) {
+    const list = byProduct.get(product.id) ?? [];
+    if (list.length === 0) {
+      // Same-day recollect found nothing for this SKU: clear today's rows only.
+      await sql(
+        `delete from price_snapshots where product_id = $1 and snapshot_date = $2::date`,
+        [product.id, dateStr],
+      );
+      await sql(
+        `delete from platform_snapshots where product_id = $1 and snapshot_date = $2::date`,
+        [product.id, dateStr],
+      );
+      continue;
+    }
+
+    const best = list.reduce((a, b) =>
+      a.priceCents <= b.priceCents ? a : b,
+    );
+    await sql(
+      `insert into price_snapshots(id, product_id, snapshot_date, min_price_cents, platform, shop_name)
+       values ($1,$2,$3::date,$4,$5,$6)
+       on conflict (product_id, snapshot_date) do update set
+         min_price_cents = excluded.min_price_cents,
+         platform = excluded.platform,
+         shop_name = excluded.shop_name`,
+      [
+        `${product.id}:${dateStr}`,
+        product.id,
+        dateStr,
+        best.priceCents,
+        best.platform,
+        best.shopName,
+      ],
+    );
+    snapCount += 1;
+
+    const byPlatform = new Map<string, StoredOffer[]>();
+    for (const o of list) {
+      const bucket = byPlatform.get(o.platform) ?? [];
+      bucket.push(o);
+      byPlatform.set(o.platform, bucket);
+    }
+    // Replace today's platform rows for this product, then insert fresh mins.
+    await sql(
+      `delete from platform_snapshots where product_id = $1 and snapshot_date = $2::date`,
+      [product.id, dateStr],
+    );
+    for (const [platform, offers] of byPlatform) {
+      const pBest = offers.reduce((a, b) =>
         a.priceCents <= b.priceCents ? a : b,
       );
       await sql(
-        `insert into price_snapshots(id, product_id, snapshot_date, min_price_cents, platform, shop_name)
+        `insert into platform_snapshots(id, product_id, snapshot_date, platform, min_price_cents, shop_name)
          values ($1,$2,$3::date,$4,$5,$6)
-         on conflict (product_id, snapshot_date) do update set
+         on conflict (product_id, snapshot_date, platform) do update set
            min_price_cents = excluded.min_price_cents,
-           platform = excluded.platform,
            shop_name = excluded.shop_name`,
         [
-          `${product.id}:${dateStr}`,
+          `${product.id}:${dateStr}:${platform}`,
           product.id,
           dateStr,
-          best.priceCents,
-          best.platform,
-          best.shopName,
+          platform,
+          pBest.priceCents,
+          pBest.shopName,
         ],
       );
-      snapCount += 1;
     }
   }
+  return snapCount;
+}
 
-  // 新闻：尽力拉取公开 RSS，失败则用标注样例
+async function writeNews(): Promise<{
+  count: number;
+  newsSource: "rss" | "fallback";
+}> {
   let news = await fetchRssNews();
   let newsSource: "rss" | "fallback" = "rss";
   if (news.length < 4) {
@@ -338,23 +368,109 @@ async function runCollect(): Promise<CollectResult> {
       [n.id, n.title, n.source, n.region, n.url, n.publishedAt, n.summary],
     );
   }
+  return { count: Math.min(news.length, 24), newsSource };
+}
 
+function buildNote(
+  report: CrawlReport,
+  priceSource: CollectResult["priceSource"],
+): string {
+  const parts = [
+    "采集策略：先请求京东/天猫/拼多多/淘宝公开搜索页（限速、标识 UA、不登录、不绕过验证码）；",
+    "若店面页被反爬拦截，则用什么值得买公开 list API 中带商城归属的成交贴；",
+    "未命中的型号不写演示价（页面显示为无报价）。",
+  ];
+  const blocked = Object.entries(report.platforms)
+    .filter(([, s]) => s.status === "blocked")
+    .map(([k]) => k);
+  if (blocked.length) {
+    parts.push(`直连被拦：${blocked.join(",")}。`);
+  }
+  parts.push(
+    `聚合源：${report.aggregator.status} — ${report.aggregator.detail}`,
+  );
+  parts.push(`本次报价模式：${priceSource}。`);
+  return parts.join(" ");
+}
+
+async function runCollect(opts: { live: boolean }): Promise<CollectResult> {
+  await upsertProducts();
+
+  const today = new Date();
+  today.setUTCHours(12, 0, 0, 0);
+
+  let crawl: CrawlReport = {
+    offers: [],
+    platforms: {
+      jd: { status: "skipped", detail: "live crawl disabled", liveOffers: 0 },
+      tmall: { status: "skipped", detail: "live crawl disabled", liveOffers: 0 },
+      pdd: { status: "skipped", detail: "live crawl disabled", liveOffers: 0 },
+      taobao: {
+        status: "skipped",
+        detail: "live crawl disabled",
+        liveOffers: 0,
+      },
+    },
+    aggregator: {
+      status: "skipped",
+      detail: "live crawl disabled",
+      liveOffers: 0,
+    },
+  };
+
+  if (opts.live) {
+    crawl = await crawlLiveOffers(CATALOG);
+  }
+
+  const stored: StoredOffer[] = [];
+  for (const live of crawl.offers) {
+    stored.push({
+      id: `live:${live.source}:${live.productId}:${live.platform}:${hashSeed(live.url + live.priceCents).toString(16)}`,
+      productId: live.productId,
+      platform: live.platform,
+      shopName: live.shopName,
+      priceCents: live.priceCents,
+      url: live.url,
+      inStock: live.inStock,
+      isDemo: false,
+    });
+  }
+
+  // Live collect: only real offers. No demo fill-ins.
+  // Offers table is always full-replace (current listing).
+  // Snapshots: only today's rows are overwritten; history kept for curves.
+  await writeOffers(stored);
+  const todaySnaps = await writeTodaySnapshots(today, stored);
+  const news = await writeNews();
+
+  const liveOffers = stored.length;
+  const priceSource: CollectResult["priceSource"] =
+    liveOffers > 0 ? "live" : "empty";
+
+  const histCount = await sql<{ n: string }>(
+    "select count(*)::text as n from price_snapshots",
+  );
   const result: CollectResult = {
     products: CATALOG.length,
-    offers: offerCount,
-    snapshots: snapCount,
-    news: Math.min(news.length, 24),
-    newsSource,
-    priceSource: "demo",
-    note:
-      "电商平台（京东/天猫/拼多多/淘宝）公开页反爬较强，MVP 报价为可复现演示数据；新闻优先公开 RSS，失败时使用标注样例。",
+    offers: stored.length,
+    snapshots: Number(histCount[0]?.n ?? todaySnaps),
+    news: news.count,
+    newsSource: news.newsSource,
+    priceSource,
+    liveOffers,
+    demoOffers: 0,
+    platformStatus: crawl.platforms,
+    aggregatorStatus: crawl.aggregator,
+    note: opts.live
+      ? `${buildNote(crawl, priceSource)} 当日快照已覆盖写入（历史日期保留）。`
+      : "尚未实采。请运行 npm run collect，或在已启动的站点请求 /api/refresh。本地数据保存在 .data/pglite，与网页共用。",
   };
   await metaSet("last_collect", JSON.stringify(result));
   await metaSet("seeded", "1");
   return result;
 }
 
-/** 确保库已灌入种子/演示数据；同进程只跑一次。 */
+/** 确保产品目录存在；若已有实采结果则复用（文件库跨进程共享）。 */
 export async function ensureData(): Promise<CollectResult> {
   if (!ensurePromise) {
     ensurePromise = (async () => {
@@ -369,7 +485,8 @@ export async function ensureData(): Promise<CollectResult> {
           }
         }
       }
-      return runCollect();
+      // Fast bootstrap: catalog only, no demo prices.
+      return runCollect({ live: false });
     })().catch((err) => {
       ensurePromise = null;
       throw err;
@@ -378,9 +495,11 @@ export async function ensureData(): Promise<CollectResult> {
   return ensurePromise;
 }
 
-/** 强制重新采集（演示刷新） */
+/** 强制实采；只保留真实报价，不写演示。 */
 export async function refreshCollect(): Promise<CollectResult> {
   ensurePromise = null;
   await metaSet("seeded", "0");
-  return ensureData();
+  const result = await runCollect({ live: true });
+  ensurePromise = Promise.resolve(result);
+  return result;
 }
